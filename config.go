@@ -1,9 +1,9 @@
 package openvpn
 
 import (
+	"context"
+	"net"
 	"net/netip"
-
-	C "github.com/airofm/sing-openvpn/internal/constant"
 )
 
 type Remote struct {
@@ -26,5 +26,9 @@ type Config struct {
 	IP          netip.Addr
 	Mask        netip.Prefix
 	MTU         int
-	Dialer      C.Dialer
+	Dialer      Dialer
+}
+
+type Dialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }

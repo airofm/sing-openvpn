@@ -9,16 +9,6 @@ import (
 	"strings"
 )
 
-// ParseOVPNFile parses an OpenVPN configuration file from the given path.
-// It also resolves relative paths for external certificates and keys.
-func ParseOVPNFile(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return parseOVPN(data, filepath.Dir(path))
-}
-
 // ParseOVPN parses the contents of an OpenVPN configuration file.
 // It assumes all certificates and keys are embedded inline or paths are absolute.
 func ParseOVPN(data []byte) (*Config, error) {

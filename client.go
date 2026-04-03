@@ -55,18 +55,16 @@ type Client struct {
 	cancel context.CancelFunc
 }
 
-// NewClientFromFile parses an .ovpn file, sets the provided credentials, and returns a new Client.
-func NewClientFromFile(ovpnPath, username, password string) (*Client, error) {
-	cfg, err := ParseOVPNFile(ovpnPath)
+// NewClient parses the .ovpn configuration content and initializes a new Client.
+func NewClient(ovpnContent []byte, username, password string, dialer Dialer) (*Client, error) {
+	cfg, err := ParseOVPN(ovpnContent)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse ovpn file: %w", err)
+		return nil, fmt.Errorf("failed to parse ovpn content: %w", err)
 	}
 	cfg.Username = username
 	cfg.Password = password
-	return NewClient(cfg), nil
-}
+	cfg.Dialer = dialer
 
-func NewClient(cfg *Config) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Generate random Session ID
@@ -92,7 +90,7 @@ func NewClient(cfg *Config) *Client {
 		}
 	}
 
-	return c
+	return c, nil
 }
 
 func (c *Client) Dial(ctx context.Context) error {

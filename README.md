@@ -53,14 +53,20 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 
 	openvpn "github.com/airofm/sing-openvpn"
 )
 
 func main() {
-	// 1. 直接通过 .ovpn 配置文件和账号密码初始化客户端
+	// 1. 读取 .ovpn 配置文件内容并初始化客户端
 	// 也可以传入空字符串作为账号密码，如果服务器不需要密码认证
-	client, err := openvpn.NewClientFromFile("config.ovpn", "your_username", "your_password")
+	// 最后一个参数 dialer 可用于指定底层网络连接方式（在集成到 sing-box/mihomo 等环境时可传入其 Dialer，直接使用直连可传 nil）
+	ovpnContent, err := os.ReadFile("config.ovpn")
+	if err != nil {
+		log.Fatalf("Read config error: %v", err)
+	}
+	client, err := openvpn.NewClient(ovpnContent, "your_username", "your_password", nil)
 	if err != nil {
 		log.Fatalf("Init error: %v", err)
 	}

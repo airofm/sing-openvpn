@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	openvpn "github.com/airofm/sing-openvpn"
@@ -20,7 +21,12 @@ func main() {
 	password := "your_password"
 
 	log.Printf("Parsing OpenVPN config: %s", ovpnPath)
-	client, err := openvpn.NewClientFromFile(ovpnPath, username, password)
+	ovpnContent, err := os.ReadFile(ovpnPath)
+	if err != nil {
+		log.Fatalf("Failed to read ovpn file: %v", err)
+	}
+
+	client, err := openvpn.NewClient(ovpnContent, username, password, nil)
 	if err != nil {
 		log.Fatalf("Init error: %v", err)
 	}
