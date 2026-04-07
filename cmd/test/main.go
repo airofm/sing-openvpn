@@ -15,7 +15,7 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	
+
 	ovpnPath := "path/to/your/profile.ovpn"
 	username := "your_username"
 	password := "your_password"
@@ -42,7 +42,7 @@ func main() {
 	log.Println("OpenVPN connected successfully! TUN device is up.")
 
 	// Test HTTP request through the VPN tunnel
-	targetURL := "https://example.com/"
+	targetURL := "https://dss.ogdps.com/"
 	log.Printf("Testing connection to %s via VPN...", targetURL)
 
 	// Create a custom HTTP client that uses our VPN tunnel
@@ -50,18 +50,21 @@ func main() {
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				log.Printf("Dialing %s via VPN...", addr)
-				
+
 				host, port, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, err
 				}
-				
+
 				// Use a custom resolver that queries the pushed DNS server through the VPN
 				resolver := &net.Resolver{
 					PreferGo: true,
 					Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-						// You should replace this with the DNS server pushed by your OpenVPN server
 						dnsServer := "8.8.8.8:53"
+						cfg := client.GetConfig()
+						if len(cfg.DNS) > 0 {
+							dnsServer = cfg.DNS[0] + ":53"
+						}
 						log.Printf("Dialing DNS %s via VPN...", dnsServer)
 						return client.DialContext(ctx, "udp", dnsServer)
 					},
@@ -95,11 +98,11 @@ func main() {
 	defer resp.Body.Close()
 
 	log.Printf("HTTP Status: %s", resp.Status)
-	
+
 	// Read a small portion of the body to verify
 	body := make([]byte, 512)
 	n, _ := io.ReadFull(resp.Body, body)
 	log.Printf("Response Body (first %d bytes):\n%s", n, string(body[:n]))
-	
+
 	log.Println("Test completed successfully!")
 }

@@ -1,9 +1,9 @@
 package openvpn
 
 import (
-	"fmt"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -50,13 +50,18 @@ func (c *Client) readLoop() {
 	for {
 		var data []byte
 		var err error
+		conn := c.conn
+		if conn == nil {
+			c.errChan <- fmt.Errorf("connection is nil")
+			return
+		}
 
 		// Clear any previously set deadline
-		c.conn.SetReadDeadline(time.Time{})
+		conn.SetReadDeadline(time.Time{})
 
 		if !c.isUDP() {
 			// TCP: 2-byte length header
-			_, err = io.ReadFull(c.conn, lenBuf)
+			_, err = io.ReadFull(conn, lenBuf)
 			if err != nil {
 				log.Warnln("[OpenVPN] readLoop TCP read error: %v", err)
 				c.errChan <- err
@@ -70,10 +75,10 @@ func (c *Client) readLoop() {
 				return
 			}
 			data = buf[:length]
-			_, err = io.ReadFull(c.conn, data)
+			_, err = io.ReadFull(conn, data)
 		} else {
 			// UDP: full packet
-			n, errRead := c.conn.Read(buf)
+			n, errRead := conn.Read(buf)
 			if errRead != nil {
 				log.Warnln("[OpenVPN] readLoop UDP read error: %v", errRead)
 				c.errChan <- errRead
