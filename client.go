@@ -32,6 +32,7 @@ type Client struct {
 	ackWaiters sync.Map // uint32 -> chan struct{}
 
 	lastActivity int64 // unix timestamp in seconds
+	alive        int32 // 1 = alive, 0 = dead (atomic)
 
 	tlsConn          *tls.Conn
 	controlConn      *ControlConn
@@ -53,6 +54,8 @@ type Client struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	onClose func() // callback invoked when connection dies
 }
 
 // NewClient parses the .ovpn configuration content and initializes a new Client.
@@ -94,76 +97,60 @@ func NewClient(ovpnContent []byte, username, password string, dialer Dialer) (*C
 }
 
 func (c *Client) Dial(ctx context.Context) error {
-	var lastErr error
-	for _, remote := range c.cfg.Remotes {
-		network := "udp"
-		if !remote.UDP {
-			network = "tcp"
-		}
+	dialStart := time.Now()
+	log.Infoln("[OpenVPN] Dial started at %s", dialStart.Format(time.RFC3339Nano))
 
-		// Resolve host manually to avoid net.DefaultResolver panic
-		var ip netip.Addr
-		var err error
-		addrs, lookupErr := net.DefaultResolver.LookupHost(ctx, remote.Server)
-		if lookupErr != nil || len(addrs) == 0 {
-			err = fmt.Errorf("DNS lookup failed: %v", lookupErr)
-		} else {
-			ip, err = netip.ParseAddr(addrs[0])
-		}
-		if err != nil {
-			log.Warnln("[OpenVPN] Failed to resolve %s: %v", remote.Server, err)
-			lastErr = err
-			continue
-		}
-
-		addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", remote.Port))
-		log.Infoln("[OpenVPN] Trying to connect to %s (%s, server: %s)", addr, network, remote.Server)
-
-		var conn net.Conn
-		if c.cfg.Dialer != nil {
-			conn, err = c.cfg.Dialer.DialContext(ctx, network, addr)
-		} else {
-			dialer := &net.Dialer{Timeout: 5 * time.Second}
-			conn, err = dialer.DialContext(ctx, network, addr)
-		}
-
-		if err != nil {
-			log.Warnln("[OpenVPN] Failed to connect to %s: %v", addr, err)
-			lastErr = err
-			continue
-		}
-
-		c.conn = conn
-		c.isUDPConn = remote.UDP
-
-		// Start the read loop (runs for the lifetime of the connection)
-		go c.readLoop()
-
-		// Try handshake
-		err = c.performHandshake(ctx)
-		if err != nil {
-			log.Warnln("[OpenVPN] Handshake failed with %s: %v", addr, err)
-			c.cancel() // Stop the readLoop
-			c.conn.Close()
-			c.conn = nil
-			// Re-create context for next attempt
-			c.ctx, c.cancel = context.WithCancel(context.Background())
-			lastErr = err
-			continue
-		}
-
-		// Handshake successful, readLoop continues running
-		break
-	}
-
-	if c.conn == nil {
-		if lastErr != nil {
-			return fmt.Errorf("failed to connect to any remote: %w", lastErr)
-		}
+	if len(c.cfg.Remotes) == 0 {
 		return fmt.Errorf("no remotes configured")
 	}
 
+	// For a single remote, connect directly (no goroutine overhead)
+	if len(c.cfg.Remotes) == 1 {
+		if err := c.tryRemote(ctx, c.cfg.Remotes[0]); err != nil {
+			return fmt.Errorf("failed to connect to any remote: %w", err)
+		}
+	} else {
+		// Multiple remotes: try in parallel, first success wins
+		type result struct {
+			err error
+		}
+		winCh := make(chan result, len(c.cfg.Remotes))
+		raceCtx, raceCancel := context.WithCancel(ctx)
+		defer raceCancel()
+
+		for _, remote := range c.cfg.Remotes {
+			go func(r Remote) {
+				// Each goroutine creates a temporary client state to attempt connection.
+				// The winner will apply its state to `c`.
+				err := c.tryRemote(raceCtx, r)
+				winCh <- result{err: err}
+			}(remote)
+		}
+
+		var lastErr error
+		success := false
+		for range c.cfg.Remotes {
+			res := <-winCh
+			if res.err == nil && !success {
+				success = true
+				raceCancel() // cancel other attempts
+			} else if res.err != nil {
+				lastErr = res.err
+			}
+		}
+		if !success {
+			return fmt.Errorf("failed to connect to any remote: %w", lastErr)
+		}
+	}
+
+	log.Infoln("[OpenVPN] Remote connection + handshake took %s", time.Since(dialStart))
+
+	if c.conn == nil {
+		return fmt.Errorf("failed to connect: no connection established")
+	}
+
 	// 6. Initialize TUN device with negotiated parameters
+	tunStart := time.Now()
 	mtu := c.cfg.MTU
 	if mtu == 0 {
 		mtu = 1500
@@ -189,11 +176,108 @@ func (c *Client) Dial(ctx context.Context) error {
 	if err := c.tunDevice.Start(); err != nil {
 		return err
 	}
+	log.Infoln("[OpenVPN] TUN device init took %s", time.Since(tunStart))
 
-	// Start TUN loops — route-delay wait is handled inside tunReadLoop
+	// Mark connection as alive
+	atomic.StoreInt32(&c.alive, 1)
+
+	// Wait for route-delay: the server needs this time to set up its routing/NAT.
+	// Packets sent before this delay expires will be silently dropped by the server.
+	if c.routeDelay > 0 {
+		log.Infoln("[OpenVPN] Waiting %d seconds for server route-delay before sending data...", c.routeDelay)
+		select {
+		case <-time.After(time.Duration(c.routeDelay) * time.Second):
+			log.Infoln("[OpenVPN] Route-delay wait completed")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// Start TUN loops
 	go c.tunReadLoop()
 	go c.pingLoop()
+	go c.errorMonitor()
 
+	log.Infoln("[OpenVPN] Dial completed, total time: %s", time.Since(dialStart))
+	return nil
+}
+
+// tryRemote attempts to connect and handshake with a single remote.
+// On success, it sets c.conn and related state. The caller must ensure
+// that only one successful tryRemote applies its state (via mutex).
+func (c *Client) tryRemote(ctx context.Context, remote Remote) error {
+	tryStart := time.Now()
+	network := "udp"
+	if !remote.UDP {
+		network = "tcp"
+	}
+
+	// Resolve host
+	dnsStart := time.Now()
+	addrs, lookupErr := net.DefaultResolver.LookupHost(ctx, remote.Server)
+	if lookupErr != nil || len(addrs) == 0 {
+		log.Warnln("[OpenVPN] Failed to resolve %s: %v", remote.Server, lookupErr)
+		return fmt.Errorf("DNS lookup failed for %s: %v", remote.Server, lookupErr)
+	}
+	ip, err := netip.ParseAddr(addrs[0])
+	if err != nil {
+		return fmt.Errorf("invalid IP for %s: %v", remote.Server, err)
+	}
+
+	log.Infoln("[OpenVPN] DNS resolve for %s took %s -> %s", remote.Server, time.Since(dnsStart), ip.String())
+
+	addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", remote.Port))
+	log.Infoln("[OpenVPN] Trying to connect to %s (%s, server: %s)", addr, network, remote.Server)
+	connStart := time.Now()
+
+	var conn net.Conn
+	if c.cfg.Dialer != nil {
+		conn, err = c.cfg.Dialer.DialContext(ctx, network, addr)
+	} else {
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		conn, err = dialer.DialContext(ctx, network, addr)
+	}
+	if err != nil {
+		log.Warnln("[OpenVPN] Failed to connect to %s: %v", addr, err)
+		return err
+	}
+
+	log.Infoln("[OpenVPN] TCP/UDP connect to %s took %s", addr, time.Since(connStart))
+
+	// Use mutex to prevent race: only first successful handshake wins
+	c.mutex.Lock()
+	if c.conn != nil {
+		// Another goroutine already won
+		c.mutex.Unlock()
+		conn.Close()
+		return fmt.Errorf("another remote already connected")
+	}
+	c.conn = conn
+	c.isUDPConn = remote.UDP
+	c.mutex.Unlock()
+
+	// Start read loop
+	go c.readLoop()
+
+	// Try handshake
+	hsStart := time.Now()
+	err = c.performHandshake(ctx)
+	if err != nil {
+		log.Warnln("[OpenVPN] Handshake failed with %s: %v", addr, err)
+		c.mutex.Lock()
+		// Only reset if we are still the active connection
+		if c.conn == conn {
+			c.cancel()
+			c.conn.Close()
+			c.conn = nil
+			c.ctx, c.cancel = context.WithCancel(context.Background())
+		}
+		c.mutex.Unlock()
+		return err
+	}
+
+	log.Infoln("[OpenVPN] Handshake with %s took %s", addr, time.Since(hsStart))
+	log.Infoln("[OpenVPN] Successfully connected to %s (%s), total tryRemote time: %s", addr, network, time.Since(tryStart))
 	return nil
 }
 
@@ -235,6 +319,33 @@ func (c *Client) updateActivity() {
 	atomic.StoreInt64(&c.lastActivity, time.Now().Unix())
 }
 
+// IsAlive returns true if the VPN connection is still active.
+func (c *Client) IsAlive() bool {
+	return atomic.LoadInt32(&c.alive) == 1
+}
+
+// SetOnClose registers a callback that is invoked when the connection dies.
+func (c *Client) SetOnClose(fn func()) {
+	c.onClose = fn
+}
+
+// errorMonitor runs after handshake, continuously draining errChan.
+// On fatal error it closes the client so that mihomo can detect and reconnect.
+func (c *Client) errorMonitor() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case err := <-c.errChan:
+			if err != nil {
+				log.Warnln("[OpenVPN] errorMonitor: fatal error detected: %v, closing connection", err)
+				c.Close()
+				return
+			}
+		}
+	}
+}
+
 func (c *Client) pingLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -245,12 +356,11 @@ func (c *Client) pingLoop() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			// Check for timeout (e.g., 60 seconds without activity)
+			// Check for timeout: 15 seconds without any activity
 			last := atomic.LoadInt64(&c.lastActivity)
-			if time.Now().Unix()-last > 60 {
-				log.Warnln("[OpenVPN] Ping timeout: no data received for 60 seconds, closing connection")
+			if time.Now().Unix()-last > 15 {
+				log.Warnln("[OpenVPN] Ping timeout: no data received for 15 seconds, closing connection")
 				c.errChan <- fmt.Errorf("ping timeout")
-				c.Close()
 				return
 			}
 
@@ -266,7 +376,11 @@ func (c *Client) pingLoop() {
 						PeerID:  c.peerID,
 						Payload: pingData,
 					}
-					c.writePacket(p)
+					if writeErr := c.writePacket(p); writeErr != nil {
+						log.Warnln("[OpenVPN] Ping write failed: %v", writeErr)
+						c.errChan <- writeErr
+						return
+					}
 				}
 			}
 		}
@@ -274,6 +388,13 @@ func (c *Client) pingLoop() {
 }
 
 func (c *Client) Close() error {
+	// Only run close logic once via alive flag
+	if !atomic.CompareAndSwapInt32(&c.alive, 1, 0) {
+		// Already closed or never alive, just cancel context
+		c.cancel()
+		return nil
+	}
+
 	c.cancel()
 	var err error
 	if c.conn != nil {
@@ -283,6 +404,11 @@ func (c *Client) Close() error {
 		if e := c.tunDevice.Close(); e != nil {
 			err = e
 		}
+	}
+
+	// Invoke onClose callback to notify mihomo adapter
+	if c.onClose != nil {
+		c.onClose()
 	}
 	return err
 }

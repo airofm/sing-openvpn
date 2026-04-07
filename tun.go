@@ -11,10 +11,8 @@ import (
 
 func (c *Client) tunReadLoop() {
 	log.Infoln("[OpenVPN] tunReadLoop started")
-	// Note: We intentionally do NOT wait for route-delay here.
-	// route-delay is intended for the client-side OS to install routes (e.g. Windows).
-	// Our gvisor TUN stack has virtual routing that is ready immediately.
-	// The server-side NAT/routes are ready by the time PUSH_REPLY is sent.
+	// Route-delay waiting is handled in Dial() before starting this loop,
+	// ensuring the server has finished setting up its routing/NAT.
 
 	bufPtr := bufPool.Get().(*[]byte)
 	buf := *bufPtr

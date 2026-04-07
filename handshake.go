@@ -19,7 +19,10 @@ import (
 )
 
 func (c *Client) performHandshake(ctx context.Context) error {
+	hsStart := time.Now()
+
 	// 1. Send Hard Reset
+	log.Debugln("[OpenVPN] Phase 1: Sending Hard Reset")
 	if err := c.sendReset(); err != nil {
 		return err
 	}
@@ -35,6 +38,7 @@ func (c *Client) performHandshake(ctx context.Context) error {
 	case <-c.handshakeStarted:
 		// Server responded with Hard Reset, continue to TLS
 	}
+	log.Infoln("[OpenVPN] Phase 1: Hard Reset exchange took %s", time.Since(hsStart))
 
 	// 3. TLS Handshake
 	tlsConfig := &tls.Config{
@@ -87,18 +91,24 @@ func (c *Client) performHandshake(ctx context.Context) error {
 	c.tlsConn = tls.Client(c.controlConn, tlsConfig)
 
 	// 4. Perform TLS Handshake and Post-Handshake Negotiation
+	tlsStart := time.Now()
+	log.Debugln("[OpenVPN] Phase 2: Starting TLS handshake")
 	if err := c.tlsConn.HandshakeContext(ctx); err != nil {
 		return fmt.Errorf("TLS handshake failed: %w", err)
 	}
 	{
 		cs := c.tlsConn.ConnectionState()
-		log.Infoln("[OpenVPN] TLS Handshake completed: version=0x%04X cipherSuite=0x%04X", cs.Version, cs.CipherSuite)
+		log.Infoln("[OpenVPN] Phase 2: TLS Handshake completed in %s: version=0x%04X cipherSuite=0x%04X", time.Since(tlsStart), cs.Version, cs.CipherSuite)
 	}
 
 	// 5. Send PUSH_REQUEST and wait for PUSH_REPLY
+	negoStart := time.Now()
+	log.Debugln("[OpenVPN] Phase 3: Starting config negotiation (key exchange + PUSH)")
 	if err := c.negotiateConfig(ctx); err != nil {
 		return fmt.Errorf("config negotiation failed: %w", err)
 	}
+	log.Infoln("[OpenVPN] Phase 3: Config negotiation took %s", time.Since(negoStart))
+	log.Infoln("[OpenVPN] Total handshake time: %s", time.Since(hsStart))
 
 	return nil
 }

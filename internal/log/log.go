@@ -13,7 +13,7 @@ func Warnln(format string, v ...interface{}) {
 }
 
 func Debugln(format string, v ...interface{}) {
-	// log.Printf("[DEBUG] " + format + "\n", v...)
+	log.Printf("[DEBUG] "+format+"\n", v...)
 }
 
 func Errorln(format string, v ...interface{}) {

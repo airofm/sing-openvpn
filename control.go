@@ -105,12 +105,16 @@ func (c *ControlConn) Write(b []byte) (n int, err error) {
 				return offset, err
 			}
 
-			// Wait for ACK or timeout
+			// Wait for ACK with exponential backoff: 1s, 2s, 4s, 8s, 8s
+			backoff := time.Duration(1<<uint(attempt)) * time.Second
+			if backoff > 8*time.Second {
+				backoff = 8 * time.Second
+			}
 			select {
 			case <-ackCh:
 				sent = true
 				goto Acked
-			case <-time.After(2 * time.Second):
+			case <-time.After(backoff):
 				// Timeout, will retry in next loop iteration
 			}
 		}
