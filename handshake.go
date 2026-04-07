@@ -468,6 +468,7 @@ func (c *Client) parsePushReply(reply string) error {
 		} else if strings.HasPrefix(part, "dhcp-option DNS ") {
 			dns := strings.TrimPrefix(part, "dhcp-option DNS ")
 			dns = strings.TrimSpace(dns)
+			c.cfg.DNS = append(c.cfg.DNS, dns)
 			log.Infoln("[OpenVPN] Pushed DNS server: %s", dns)
 		} else if strings.HasPrefix(part, "route ") {
 			log.Infoln("[OpenVPN] Pushed route: %s", strings.TrimPrefix(part, "route "))

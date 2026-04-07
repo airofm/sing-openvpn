@@ -26,6 +26,7 @@ type Config struct {
 	IP          netip.Addr
 	Mask        netip.Prefix
 	MTU         int
+	DNS         []string
 	Dialer      Dialer
 }
 

@@ -197,6 +197,10 @@ func (c *Client) Dial(ctx context.Context) error {
 	return nil
 }
 
+func (c *Client) GetConfig() *Config {
+	return c.cfg
+}
+
 func (c *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if c.tunDevice == nil {
 		return nil, fmt.Errorf("openvpn client not fully initialized")
