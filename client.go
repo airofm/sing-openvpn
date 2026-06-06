@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,11 @@ import (
 	wireguard "github.com/metacubex/sing-wireguard"
 	M "github.com/metacubex/sing/common/metadata"
 	"github.com/metacubex/tls"
+)
+
+const (
+	keyDerivationPRF    = "prf"
+	keyDerivationTLSEKM = "tls-ekm"
 )
 
 type Client struct {
@@ -46,6 +52,7 @@ type Client struct {
 	clientRandom2   []byte // 32 bytes
 	serverRandom1   []byte // 32 bytes
 	serverRandom2   []byte // 32 bytes
+	keyDerivation   string // data-channel key derivation selected by PUSH_REPLY
 
 	routeDelay int // seconds to wait after connection before routing is ready (from route-delay push)
 
@@ -77,6 +84,7 @@ func NewClient(ovpnContent []byte, username, password string, dialer Dialer) (*C
 	c := &Client{
 		cfg:              cfg,
 		localSID:         sid,
+		keyDerivation:    keyDerivationPRF,
 		handshakeStarted: make(chan struct{}, 1),
 		errChan:          make(chan error, 10),
 		ctx:              ctx,
@@ -219,73 +227,102 @@ func (c *Client) tryRemote(ctx context.Context, remote Remote) error {
 		log.Warnln("[OpenVPN] Failed to resolve %s: %v", remote.Server, lookupErr)
 		return fmt.Errorf("DNS lookup failed for %s: %v", remote.Server, lookupErr)
 	}
-	ip, err := netip.ParseAddr(addrs[0])
-	if err != nil {
-		return fmt.Errorf("invalid IP for %s: %v", remote.Server, err)
+	ips := sortRemoteIPs(addrs)
+	if len(ips) == 0 {
+		return fmt.Errorf("DNS lookup returned no valid IP for %s", remote.Server)
 	}
 
-	log.Infoln("[OpenVPN] DNS resolve for %s took %s -> %s", remote.Server, time.Since(dnsStart), ip.String())
+	log.Infoln("[OpenVPN] DNS resolve for %s took %s -> %v", remote.Server, time.Since(dnsStart), ips)
 
-	addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", remote.Port))
-	log.Infoln("[OpenVPN] Trying to connect to %s (%s, server: %s)", addr, network, remote.Server)
-	connStart := time.Now()
+	var lastErr error
+	for _, ip := range ips {
+		addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", remote.Port))
+		log.Infoln("[OpenVPN] Trying to connect to %s (%s, server: %s)", addr, network, remote.Server)
+		connStart := time.Now()
 
-	var conn net.Conn
-	if c.cfg.Dialer != nil {
-		conn, err = c.cfg.Dialer.DialContext(ctx, network, addr)
-	} else {
-		dialer := &net.Dialer{Timeout: 5 * time.Second}
-		conn, err = dialer.DialContext(ctx, network, addr)
-	}
-	if err != nil {
-		log.Warnln("[OpenVPN] Failed to connect to %s: %v", addr, err)
-		return err
-	}
-
-	log.Infoln("[OpenVPN] TCP/UDP connect to %s took %s", addr, time.Since(connStart))
-
-	// Use mutex to prevent race: only first successful handshake wins
-	c.mutex.Lock()
-	if c.conn != nil {
-		// Another goroutine already won
-		c.mutex.Unlock()
-		conn.Close()
-		return fmt.Errorf("another remote already connected")
-	}
-	c.conn = conn
-	c.isUDPConn = remote.UDP
-	c.mutex.Unlock()
-
-	// Start read loop
-	go c.readLoop()
-
-	// Try handshake
-	hsStart := time.Now()
-	err = c.performHandshake(ctx)
-	if err != nil {
-		log.Warnln("[OpenVPN] Handshake failed with %s: %v", addr, err)
-		c.mutex.Lock()
-		// Only reset if we are still the active connection
-		if c.conn == conn {
-			c.cancel()
-			c.conn.Close()
-			c.conn = nil
-			c.ctx, c.cancel = context.WithCancel(context.Background())
+		var conn net.Conn
+		var err error
+		if c.cfg.Dialer != nil {
+			conn, err = c.cfg.Dialer.DialContext(ctx, network, addr)
+		} else {
+			dialer := &net.Dialer{Timeout: 5 * time.Second}
+			conn, err = dialer.DialContext(ctx, network, addr)
 		}
+		if err != nil {
+			lastErr = err
+			log.Warnln("[OpenVPN] Failed to connect to %s: %v", addr, err)
+			continue
+		}
+
+		log.Infoln("[OpenVPN] TCP/UDP connect to %s took %s", addr, time.Since(connStart))
+
+		// Use mutex to prevent race: only first successful handshake wins
+		c.mutex.Lock()
+		if c.conn != nil {
+			// Another goroutine already won
+			c.mutex.Unlock()
+			conn.Close()
+			return fmt.Errorf("another remote already connected")
+		}
+		c.conn = conn
+		c.isUDPConn = remote.UDP
 		c.mutex.Unlock()
-		return err
+
+		// Start read loop
+		go c.readLoop()
+
+		// Try handshake
+		hsStart := time.Now()
+		err = c.performHandshake(ctx)
+		if err != nil {
+			lastErr = err
+			log.Warnln("[OpenVPN] Handshake failed with %s: %v", addr, err)
+			c.mutex.Lock()
+			// Only reset if we are still the active connection
+			if c.conn == conn {
+				c.cancel()
+				c.conn.Close()
+				c.conn = nil
+				c.ctx, c.cancel = context.WithCancel(context.Background())
+			}
+			c.mutex.Unlock()
+			continue
+		}
+
+		log.Infoln("[OpenVPN] Handshake with %s took %s", addr, time.Since(hsStart))
+		log.Infoln("[OpenVPN] Successfully connected to %s (%s), total tryRemote time: %s", addr, network, time.Since(tryStart))
+		return nil
 	}
 
-	log.Infoln("[OpenVPN] Handshake with %s took %s", addr, time.Since(hsStart))
-	log.Infoln("[OpenVPN] Successfully connected to %s (%s), total tryRemote time: %s", addr, network, time.Since(tryStart))
-	return nil
+	return lastErr
+}
+
+func sortRemoteIPs(addrs []string) []netip.Addr {
+	ips := make([]netip.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		ip, err := netip.ParseAddr(addr)
+		if err != nil {
+			continue
+		}
+		ips = append(ips, ip)
+	}
+	sort.SliceStable(ips, func(i, j int) bool {
+		return ips[i].Is4() && !ips[j].Is4()
+	})
+	return ips
 }
 
 func (c *Client) GetConfig() *Config {
+	if c == nil {
+		return nil
+	}
 	return c.cfg
 }
 
 func (c *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if c == nil {
+		return nil, fmt.Errorf("openvpn client not initialized")
+	}
 	if c.tunDevice == nil {
 		return nil, fmt.Errorf("openvpn client not fully initialized")
 	}
@@ -297,6 +334,9 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 }
 
 func (c *Client) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	if c == nil {
+		return nil, fmt.Errorf("openvpn client not initialized")
+	}
 	if c.tunDevice == nil {
 		return nil, fmt.Errorf("openvpn client not fully initialized")
 	}
@@ -321,11 +361,17 @@ func (c *Client) updateActivity() {
 
 // IsAlive returns true if the VPN connection is still active.
 func (c *Client) IsAlive() bool {
+	if c == nil {
+		return false
+	}
 	return atomic.LoadInt32(&c.alive) == 1
 }
 
 // SetOnClose registers a callback that is invoked when the connection dies.
 func (c *Client) SetOnClose(fn func()) {
+	if c == nil {
+		return
+	}
 	c.onClose = fn
 }
 
@@ -388,6 +434,9 @@ func (c *Client) pingLoop() {
 }
 
 func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
 	// Only run close logic once via alive flag
 	if !atomic.CompareAndSwapInt32(&c.alive, 1, 0) {
 		// Already closed or never alive, just cancel context

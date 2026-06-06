@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	openvpn "github.com/airofm/sing-openvpn"
@@ -16,9 +19,25 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	ovpnPath := "path/to/your/profile.ovpn"
-	username := "your_username"
-	password := "your_password"
+	if len(os.Args) < 3 {
+		log.Fatalf("Usage: %s <profile.ovpn> <target-url> [clash-yaml proxy-name]", os.Args[0])
+	}
+	ovpnPath := os.Args[1]
+	targetURL := os.Args[2]
+	username := os.Getenv("OPENVPN_USERNAME")
+	password := os.Getenv("OPENVPN_PASSWORD")
+	if username == "" && password == "" && len(os.Args) >= 5 {
+		loadedUsername, loadedPassword, found, err := loadProxyCredentials(os.Args[3], os.Args[4])
+		if err != nil {
+			log.Fatalf("Failed to load proxy credentials: %v", err)
+		}
+		if !found {
+			log.Fatalf("Proxy %q not found in %s", os.Args[4], os.Args[3])
+		}
+		username = loadedUsername
+		password = loadedPassword
+		log.Printf("Loaded proxy credentials for %s (values hidden)", os.Args[4])
+	}
 
 	log.Printf("Parsing OpenVPN config: %s", ovpnPath)
 	ovpnContent, err := os.ReadFile(ovpnPath)
@@ -42,18 +61,24 @@ func main() {
 	log.Println("OpenVPN connected successfully! TUN device is up.")
 
 	// Test HTTP request through the VPN tunnel
-	targetURL := "https://dss.ogdps.com/"
 	log.Printf("Testing connection to %s via VPN...", targetURL)
 
 	// Create a custom HTTP client that uses our VPN tunnel
 	httpClient := &http.Client{
 		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: os.Getenv("OPENVPN_TEST_INSECURE_SKIP_VERIFY") == "1"},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				log.Printf("Dialing %s via VPN...", addr)
 
 				host, port, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, err
+				}
+
+				if parsedIP := net.ParseIP(host); parsedIP != nil {
+					ipAddr := net.JoinHostPort(parsedIP.String(), port)
+					log.Printf("Target is already an IP, dialing %s via VPN...", ipAddr)
+					return client.DialContext(ctx, network, ipAddr)
 				}
 
 				// Use a custom resolver that queries the pushed DNS server through the VPN
@@ -105,4 +130,55 @@ func main() {
 	log.Printf("Response Body (first %d bytes):\n%s", n, string(body[:n]))
 
 	log.Println("Test completed successfully!")
+}
+
+func loadProxyCredentials(path, proxyName string) (string, string, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", "", false, err
+	}
+	defer file.Close()
+
+	var username, password string
+	inProxy := false
+	found := false
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- name:") {
+			if inProxy {
+				break
+			}
+			name := yamlScalar(strings.TrimSpace(strings.TrimPrefix(trimmed, "- name:")))
+			if name == proxyName {
+				inProxy = true
+				found = true
+			}
+			continue
+		}
+		if !inProxy {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "username:"):
+			username = yamlScalar(strings.TrimSpace(strings.TrimPrefix(trimmed, "username:")))
+		case strings.HasPrefix(trimmed, "password:"):
+			password = yamlScalar(strings.TrimSpace(strings.TrimPrefix(trimmed, "password:")))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", "", false, err
+	}
+	return username, password, found, nil
+}
+
+func yamlScalar(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		if (value[0] == '\'' && value[len(value)-1] == '\'') || (value[0] == '"' && value[len(value)-1] == '"') {
+			return value[1 : len(value)-1]
+		}
+	}
+	return value
 }

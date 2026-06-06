@@ -14,20 +14,21 @@ type Remote struct {
 }
 
 type Config struct {
-	Remotes     []Remote
-	TLSCert     string
-	TLSKey      string
-	CACert      string
-	TLSCrypt    string
-	Cipher      string
-	AuthNoCache bool
-	Username    string
-	Password    string
-	IP          netip.Addr
-	Mask        netip.Prefix
-	MTU         int
-	DNS         []string
-	Dialer      Dialer
+	Remotes      []Remote
+	TLSCert      string
+	TLSKey       string
+	CACert       string
+	TLSCrypt     string
+	Cipher       string
+	AuthUserPass bool
+	AuthNoCache  bool
+	Username     string
+	Password     string
+	IP           netip.Addr
+	Mask         netip.Prefix
+	MTU          int
+	DNS          []string
+	Dialer       Dialer
 }
 
 type Dialer interface {

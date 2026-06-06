@@ -83,8 +83,8 @@ func (tc *TLSCrypt) Wrap(data []byte) ([]byte, error) {
 	plaintextPayload := data[9:]
 
 	tc.mutex.Lock()
-	seq := tc.sequence
 	tc.sequence++
+	seq := tc.sequence
 	tc.mutex.Unlock()
 
 	pidBuf := make([]byte, 8)

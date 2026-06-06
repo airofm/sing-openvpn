@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"hash"
 	"io"
@@ -91,9 +90,6 @@ func (c *CBCCipher) Encrypt(plaintext []byte) ([]byte, error) {
 	c.macPoolEnc.Put(h)
 
 	log.Debugln("[OpenVPN] CBC Encrypt: pid=%d, plaintext_len=%d, padded_len=%d, result_len=%d", pid, len(plaintext), paddedLen, len(result))
-	if len(ciphertext) <= 64 {
-		log.Debugln("[OpenVPN] CBC Encrypt: ciphertext=%s", hex.EncodeToString(ciphertext))
-	}
 
 	return result, nil
 }
@@ -138,7 +134,7 @@ func (c *CBCCipher) Decrypt(data []byte) ([]byte, error) {
 	if len(plaintext) < 4 {
 		return nil, errors.New("decrypted data too short for packet_id")
 	}
-	
+
 	packetID := binary.BigEndian.Uint32(plaintext[0:4])
 	if !c.replayWindow.Check(packetID) {
 		return nil, errors.New("replayed or stale packet")
@@ -212,7 +208,7 @@ func (c *GCMCipher) Decrypt(data []byte) ([]byte, error) {
 	}
 
 	packetID := binary.BigEndian.Uint32(data[0:4])
-	
+
 	// Fast path: check replay window before expensive decryption
 	if !c.replayWindow.Check(packetID) {
 		return nil, errors.New("replayed or stale packet")

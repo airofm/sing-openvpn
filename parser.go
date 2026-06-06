@@ -24,7 +24,7 @@ func parseOVPN(data []byte, baseDir string) (*Config, error) {
 
 	var globalProto string
 
-		readFile := func(filename string) (string, error) {
+	readFile := func(filename string) (string, error) {
 		if baseDir != "" && !filepath.IsAbs(filename) {
 			filename = filepath.Join(baseDir, filename)
 		}
@@ -141,6 +141,8 @@ func parseOVPN(data []byte, baseDir string) (*Config, error) {
 				}
 				cfg.TLSCrypt = content
 			}
+		case "auth-user-pass":
+			cfg.AuthUserPass = true
 		case "auth-nocache":
 			cfg.AuthNoCache = true
 		}

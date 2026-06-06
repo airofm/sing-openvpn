@@ -236,24 +236,23 @@ func (c *Client) negotiateConfig(ctx context.Context) error {
 		return err
 	}
 
-	// 6. Derive data channel keys using OpenVPN PRF (key_method 2)
-	// Try TLS-EKM first (TLS 1.3 or TLS 1.2 with EMS), fall back to traditional PRF
+	// 6. Derive data channel keys using the method negotiated by PUSH_REPLY.
 	var keyMaterial []byte
 
-	cs := c.tlsConn.ConnectionState()
 	keyLen := 256 // key2 = 2 * struct key (each: cipher[64] + hmac[64])
 
-	ekmMaterial, ekmErr := cs.ExportKeyingMaterial("EXPORTER-OpenVPN-datachannel", nil, keyLen)
-	if ekmErr == nil {
+	if c.keyDerivation == keyDerivationTLSEKM {
+		cs := c.tlsConn.ConnectionState()
+		ekmMaterial, ekmErr := cs.ExportKeyingMaterial("EXPORTER-OpenVPN-datakeys", nil, keyLen)
+		if ekmErr != nil {
+			return fmt.Errorf("TLS-EKM key derivation failed: %w", ekmErr)
+		}
 		keyMaterial = ekmMaterial
 		log.Infoln("[OpenVPN] Using TLS-EKM for key derivation")
 	} else {
 		// Traditional OpenVPN PRF key derivation
-		log.Infoln("[OpenVPN] Using traditional PRF for key derivation (EKM unavailable: %v)", ekmErr)
+		log.Infoln("[OpenVPN] Using traditional PRF for key derivation")
 
-		log.Debugln("[OpenVPN] PRF inputs: pre_master=%s", hex.EncodeToString(c.clientPreMaster[:8]))
-		log.Debugln("[OpenVPN] PRF inputs: client_r1=%s, server_r1=%s", hex.EncodeToString(c.clientRandom1[:8]), hex.EncodeToString(c.serverRandom1[:8]))
-		log.Debugln("[OpenVPN] PRF inputs: client_r2=%s, server_r2=%s", hex.EncodeToString(c.clientRandom2[:8]), hex.EncodeToString(c.serverRandom2[:8]))
 		log.Debugln("[OpenVPN] PRF inputs: localSID=%x, remoteSID=%x", c.localSID, c.remoteSID)
 
 		// Step 1: master = PRF(pre_master_secret, "OpenVPN master secret", client_random1, server_random1)
@@ -262,18 +261,11 @@ func (c *Client) negotiateConfig(ctx context.Context) error {
 			c.clientRandom1, c.serverRandom1,
 			nil, nil, 48)
 
-		log.Debugln("[OpenVPN] PRF master=%s", hex.EncodeToString(master[:16]))
-
 		// Step 2: key_block = PRF(master, "OpenVPN key expansion", client_random2, server_random2, client_sid, server_sid)
 		keyMaterial = crypto.OpenVPNPRF(master,
 			"OpenVPN key expansion",
 			c.clientRandom2, c.serverRandom2,
 			&c.localSID, &c.remoteSID, keyLen)
-
-		log.Debugln("[OpenVPN] PRF key_block[0:32]=%s", hex.EncodeToString(keyMaterial[:32]))
-		log.Debugln("[OpenVPN] PRF key_block[64:96]=%s", hex.EncodeToString(keyMaterial[64:96]))
-		log.Debugln("[OpenVPN] PRF key_block[128:160]=%s", hex.EncodeToString(keyMaterial[128:160]))
-		log.Debugln("[OpenVPN] PRF key_block[192:224]=%s", hex.EncodeToString(keyMaterial[192:224]))
 	}
 
 	// For key_method 2 with PRF, key_block layout is:
@@ -348,7 +340,7 @@ func (c *Client) sendKeyMethod2() error {
 	writeString(&buf, options)
 
 	// Username/password (if auth-user-pass)
-	if c.cfg.Username != "" {
+	if c.cfg.AuthUserPass {
 		writeString(&buf, c.cfg.Username)
 		writeString(&buf, c.cfg.Password)
 	}
@@ -357,7 +349,7 @@ func (c *Client) sendKeyMethod2() error {
 	if err != nil {
 		return err
 	}
-	log.Infoln("[OpenVPN] Sent key_method_2 exchange (auth=%v)", c.cfg.Username != "")
+	log.Infoln("[OpenVPN] Sent key_method_2 exchange (auth=%v)", c.cfg.AuthUserPass)
 	return nil
 }
 
@@ -409,6 +401,7 @@ func (c *Client) parsePushReply(reply string) error {
 	// Example: PUSH_REPLY,topology subnet,ifconfig 172.27.233.148 255.255.254.0,...
 	log.Infoln("[OpenVPN] PUSH_REPLY raw: %s", reply)
 	parts := strings.Split(reply, ",")
+	c.keyDerivation = keyDerivationPRF
 
 	// First pass: collect topology (needed to interpret ifconfig correctly)
 	topology := "net30" // default
@@ -496,6 +489,14 @@ func (c *Client) parsePushReply(reply string) error {
 			log.Infoln("[OpenVPN] Pushed route-delay: %s", strings.TrimPrefix(part, "route-delay "))
 		} else if strings.HasPrefix(part, "ping ") || strings.HasPrefix(part, "ping-restart ") {
 			log.Debugln("[OpenVPN] Pushed keepalive: %s", part)
+		} else if strings.HasPrefix(part, "key-derivation ") {
+			method := strings.TrimSpace(strings.TrimPrefix(part, "key-derivation "))
+			if method == keyDerivationTLSEKM {
+				c.keyDerivation = keyDerivationTLSEKM
+			} else {
+				c.keyDerivation = keyDerivationPRF
+			}
+			log.Infoln("[OpenVPN] Pushed key derivation: %s", method)
 		}
 	}
 	return nil

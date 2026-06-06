@@ -17,6 +17,7 @@ func newTestClient() *Client {
 		cfg: &Config{
 			Remotes: []Remote{{Server: "127.0.0.1", Port: 1194, UDP: true}},
 		},
+		keyDerivation:    keyDerivationPRF,
 		handshakeStarted: make(chan struct{}, 1),
 		errChan:          make(chan error, 10),
 		ctx:              ctx,
@@ -262,6 +263,65 @@ func TestSetOnClose_NilSafe(t *testing.T) {
 	err := c.Close()
 	if err != nil {
 		t.Fatalf("Close() with nil onClose should not error: %v", err)
+	}
+}
+
+func TestNilClientMethodsAreSafe(t *testing.T) {
+	var c *Client
+	if c.GetConfig() != nil {
+		t.Fatal("nil client should not have config")
+	}
+	if c.IsAlive() {
+		t.Fatal("nil client should not be alive")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("nil client Close() should not error: %v", err)
+	}
+	c.SetOnClose(func() {
+		t.Fatal("nil client SetOnClose callback should not run")
+	})
+	if _, err := c.DialContext(context.Background(), "tcp", "127.0.0.1:80"); err == nil {
+		t.Fatal("nil client DialContext should return an error")
+	}
+	if _, err := c.ListenPacket(context.Background(), "127.0.0.1:53"); err == nil {
+		t.Fatal("nil client ListenPacket should return an error")
+	}
+}
+
+func TestParsePushReplyKeyDerivation(t *testing.T) {
+	c := newTestClient()
+	defer c.cancel()
+
+	if err := c.parsePushReply("PUSH_REPLY,topology subnet,ifconfig 10.80.12.2 255.255.255.0,key-derivation tls-ekm"); err != nil {
+		t.Fatalf("parsePushReply returned error: %v", err)
+	}
+	if c.keyDerivation != keyDerivationTLSEKM {
+		t.Fatalf("expected TLS-EKM key derivation, got %q", c.keyDerivation)
+	}
+
+	if err := c.parsePushReply("PUSH_REPLY,topology subnet,ifconfig 10.80.12.3 255.255.255.0"); err != nil {
+		t.Fatalf("parsePushReply returned error: %v", err)
+	}
+	if c.keyDerivation != keyDerivationPRF {
+		t.Fatalf("expected traditional PRF key derivation, got %q", c.keyDerivation)
+	}
+}
+
+func TestSortRemoteIPsPrefersIPv4(t *testing.T) {
+	ips := sortRemoteIPs([]string{
+		"2408:822e:207a:25ae:6001:5773:1267:e5c5",
+		"113.235.33.123",
+		"bad-ip",
+	})
+
+	if len(ips) != 2 {
+		t.Fatalf("expected two valid IPs, got %d", len(ips))
+	}
+	if got := ips[0].String(); got != "113.235.33.123" {
+		t.Fatalf("expected IPv4 address first, got %s", got)
+	}
+	if !ips[1].Is6() {
+		t.Fatalf("expected IPv6 address second, got %s", ips[1])
 	}
 }
 
